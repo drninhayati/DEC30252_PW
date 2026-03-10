@@ -1,0 +1,195 @@
+Coding Prodesure B
+
+/*
+  DEC30252 PW4 - ESP32 MQTT Telemetry Test (NO NODE-RED)
+
+  Objective:
+  - Connect ESP32 to WiFi
+  - Connect to Mosquitto (MQTT Broker)
+  - Publish Temperature (DHT11) + Distance (HC-SR04) every 2 seconds
+
+  Publish Topics:
+    iot/pw4/telemetry/temperature
+    iot/pw4/telemetry/distance
+
+  Wiring:
+    DHT11 DATA  -> GPIO 4 (VCC 3.3V, GND)
+    HC-SR04 TRIG-> GPIO 5 (VCC 5V)
+    HC-SR04 ECHO-> GPIO 18 (MUST use voltage divider 5V->3.3V)
+*/
+
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <DHT.h>
+
+// ====== EDIT THESE 3 VALUES ======
+const char* WIFI_SSID = "YOUR_WIFI_NAME";
+const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";
+const char* MQTT_BROKER_IP = "YOUR_PC_IPV4_ADDRESS";  // e.g. "10.40.60.28"
+const uint16_t MQTT_PORT = 1883;
+
+// ====== TOPICS (PUBLISH) ======
+const char* TOPIC_TEMP_PUB = "iot/pw4/telemetry/temperature";
+const char* TOPIC_DIST_PUB = "iot/pw4/telemetry/distance";
+
+// ====== PINS ======
+static const int PIN_DHT  = 4;
+static const int PIN_TRIG = 5;
+static const int PIN_ECHO = 18;
+
+// ====== DHT ======
+#define DHTTYPE DHT11
+DHT dht(PIN_DHT, DHTTYPE);
+
+// ====== WIFI & MQTT ======
+WiFiClient espClient;
+PubSubClient mqtt(espClient);
+
+// ====== TIMING ======
+unsigned long lastPublishMs = 0;
+const unsigned long PUBLISH_INTERVAL_MS = 2000;
+
+// ---------- Connect WiFi ----------
+void connectWiFi() {
+  Serial.print("Connecting to WiFi: ");
+  Serial.println(WIFI_SSID);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+    if (millis() - start > 20000) {
+      Serial.println("\n[WiFi] Timeout. Re-trying...");
+      WiFi.disconnect(true);
+      delay(500);
+      WiFi.begin(WIFI_SSID, WIFI_PASS);
+      start = millis();
+    }
+  }
+
+  Serial.println("\nWiFi connected!");
+  Serial.print("ESP32 IP: ");
+  Serial.println(WiFi.localIP());
+}
+
+// ---------- MQTT callback (not used for Node-RED yet) ----------
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  // For telemetry-only test, we just print any incoming messages (optional).
+  String msg;
+  for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
+  msg.trim();
+
+  Serial.print("[MQTT RX] ");
+  Serial.print(topic);
+  Serial.print(" -> ");
+  Serial.println(msg);
+}
+
+// ---------- Connect MQTT ----------
+void connectMQTT() {
+  mqtt.setServer(MQTT_BROKER_IP, MQTT_PORT);
+  mqtt.setCallback(mqttCallback);
+
+  while (!mqtt.connected()) {
+    Serial.print("Connecting to MQTT broker ");
+    Serial.print(MQTT_BROKER_IP);
+    Serial.print(":");
+    Serial.print(MQTT_PORT);
+    Serial.print(" ... ");
+
+    String clientId = "ESP32-PW4-";
+    clientId += String((uint32_t)ESP.getEfuseMac(), HEX);
+
+    if (mqtt.connect(clientId.c_str())) {
+      Serial.println("connected!");
+
+      // Optional subscribe (can keep for later)
+      mqtt.subscribe("iot/pw4/cmd/#", 0);
+      Serial.println("Subscribed (optional): iot/pw4/cmd/#");
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(mqtt.state());
+      Serial.println(" | retry in 3s");
+      delay(3000);
+    }
+  }
+}
+
+// ---------- Read Ultrasonic distance (cm) ----------
+float readDistanceCM() {
+  digitalWrite(PIN_TRIG, LOW);
+  delayMicroseconds(2);
+  digitalWrite(PIN_TRIG, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(PIN_TRIG, LOW);
+
+  long duration = pulseIn(PIN_ECHO, HIGH, 30000); // 30ms timeout
+  if (duration == 0) return -1.0;
+
+  float distance = (duration * 0.0343) / 2.0;
+  return distance;
+}
+
+// ---------- Publish telemetry ----------
+void publishTelemetry() {
+  float t = dht.readTemperature();
+  float d = readDistanceCM();
+
+  if (isnan(t)) {
+    Serial.println("[WARN] DHT11 reading is NaN. Check wiring/GPIO 4.");
+  }
+
+  char buf[32];
+
+  // Temperature publish
+  if (!isnan(t)) {
+    dtostrf(t, 0, 2, buf);
+    mqtt.publish(TOPIC_TEMP_PUB, buf);
+    Serial.print("[PUB] Temperature: ");
+    Serial.println(buf);
+  }
+
+  // Distance publish (allow -1.00 if no echo)
+  dtostrf(d, 0, 2, buf);
+  mqtt.publish(TOPIC_DIST_PUB, buf);
+  Serial.print("[PUB] Distance: ");
+  Serial.println(buf);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  pinMode(PIN_TRIG, OUTPUT);
+  pinMode(PIN_ECHO, INPUT);
+
+  dht.begin();
+
+  connectWiFi();
+  connectMQTT();
+}
+
+void loop() {
+  // Keep WiFi alive
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[WiFi] Disconnected. Reconnecting...");
+    connectWiFi();
+  }
+
+  // Keep MQTT alive
+  if (!mqtt.connected()) {
+    Serial.println("[MQTT] Disconnected. Reconnecting...");
+    connectMQTT();
+  }
+
+  mqtt.loop();
+
+  unsigned long now = millis();
+  if (now - lastPublishMs >= PUBLISH_INTERVAL_MS) {
+    lastPublishMs = now;
+    publishTelemetry();
+  }
+}
