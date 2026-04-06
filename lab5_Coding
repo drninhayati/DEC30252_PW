@@ -1,0 +1,323 @@
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <DHT.h>
+#include <ESP32Servo.h>
+#include <ArduinoJson.h>
+
+// =====================
+// WiFi Configuration
+// =====================
+const char* WIFI_SSID = "YOUR_WIFI_NAME";
+const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+
+// =====================
+// ThingsBoard Configuration
+// =====================
+const char* THINGSBOARD_SERVER = "demo.thingsboard.io";
+const int THINGSBOARD_PORT = 1883;
+const char* TOKEN = "YOUR_DEVICE_ACCESS_TOKEN";
+
+// =====================
+// Pin Configuration
+// =====================
+#define DHTPIN       4
+#define DHTTYPE      DHT11
+
+#define TRIG_PIN     5
+#define ECHO_PIN     18
+
+#define LDR_PIN      34
+#define LED_PIN      14
+#define SERVO_PIN    13
+#define BUZZER_PIN   12
+
+// =====================
+// Objects
+// =====================
+WiFiClient espClient;
+PubSubClient client(espClient);
+DHT dht(DHTPIN, DHTTYPE);
+Servo myServo;
+
+// =====================
+// Variables
+// =====================
+unsigned long lastTelemetryTime = 0;
+const unsigned long telemetryInterval = 2000;
+
+bool ledManualState = false;
+bool buzzerManualState = false;
+int servoManualAngle = 0;
+bool manualControlEnabled = false;
+
+// Threshold automation
+const int LDR_THRESHOLD = 2000;      // boleh ubah ikut keadaan
+const int DISTANCE_THRESHOLD = 20;   // cm
+
+// =====================
+// Function: Connect WiFi
+// =====================
+void connectWiFi() {
+  Serial.println("Connecting to WiFi...");
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("\nWiFi connected");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+}
+
+// =====================
+// Function: Read Distance
+// =====================
+float readDistanceCM() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000); // timeout 30ms
+  if (duration == 0) {
+    return -1;
+  }
+
+  float distance = duration * 0.0343 / 2.0;
+  return distance;
+}
+
+// =====================
+// Function: Publish Telemetry
+// =====================
+void publishTelemetry(float temperature, float humidity, float distance, int ldrValue, bool ledState, bool buzzerState, int servoAngle) {
+  StaticJsonDocument<256> doc;
+
+  doc["temperature"] = temperature;
+  doc["humidity"] = humidity;
+  doc["distance"] = distance;
+  doc["ldr"] = ldrValue;
+  doc["led"] = ledState;
+  doc["buzzer"] = buzzerState;
+  doc["servo"] = servoAngle;
+
+  char payload[256];
+  serializeJson(doc, payload);
+
+  client.publish("v1/devices/me/telemetry", payload);
+  Serial.print("Telemetry sent: ");
+  Serial.println(payload);
+}
+
+// =====================
+// Function: Handle RPC from ThingsBoard
+// =====================
+void handleRPC(char* topic, byte* payload, unsigned int length) {
+  Serial.print("Message received [");
+  Serial.print(topic);
+  Serial.print("]: ");
+
+  String message;
+  for (unsigned int i = 0; i < length; i++) {
+    message += (char)payload[i];
+  }
+  Serial.println(message);
+
+  StaticJsonDocument<256> doc;
+  DeserializationError error = deserializeJson(doc, message);
+
+  if (error) {
+    Serial.println("JSON parse failed");
+    return;
+  }
+
+  String method = doc["method"] | "";
+  
+  // ===== LED Control =====
+  if (method == "setLED") {
+    bool params = doc["params"];
+    ledManualState = params;
+    manualControlEnabled = true;
+    digitalWrite(LED_PIN, ledManualState ? HIGH : LOW);
+    Serial.print("LED set to: ");
+    Serial.println(ledManualState);
+  }
+
+  // ===== Buzzer Control =====
+  else if (method == "setBuzzer") {
+    bool params = doc["params"];
+    buzzerManualState = params;
+    manualControlEnabled = true;
+    digitalWrite(BUZZER_PIN, buzzerManualState ? HIGH : LOW);
+    Serial.print("Buzzer set to: ");
+    Serial.println(buzzerManualState);
+  }
+
+  // ===== Servo Control =====
+  else if (method == "setServo") {
+    int angle = doc["params"];
+    angle = constrain(angle, 0, 180);
+    servoManualAngle = angle;
+    manualControlEnabled = true;
+    myServo.write(servoManualAngle);
+    Serial.print("Servo angle set to: ");
+    Serial.println(servoManualAngle);
+  }
+
+  // ===== Enable / Disable Manual Mode =====
+  else if (method == "setManualMode") {
+    bool params = doc["params"];
+    manualControlEnabled = params;
+    Serial.print("Manual mode: ");
+    Serial.println(manualControlEnabled ? "ON" : "OFF");
+  }
+}
+
+// =====================
+// Function: Reconnect MQTT
+// =====================
+void reconnect() {
+  while (!client.connected()) {
+    Serial.print("Connecting to ThingsBoard MQTT...");
+
+    if (client.connect("ESP32_Client", TOKEN, NULL)) {
+      Serial.println("connected");
+
+      // Subscribe RPC
+      client.subscribe("v1/devices/me/rpc/request/+");
+      Serial.println("Subscribed to RPC topic");
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" try again in 2 seconds");
+      delay(2000);
+    }
+  }
+}
+
+// =====================
+// Setup
+// =====================
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+
+  digitalWrite(LED_PIN, LOW);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  dht.begin();
+  myServo.attach(SERVO_PIN);
+  myServo.write(0);
+
+  connectWiFi();
+
+  client.setServer(THINGSBOARD_SERVER, THINGSBOARD_PORT);
+  client.setCallback(handleRPC);
+}
+
+// =====================
+// Loop
+// =====================
+void loop() {
+  if (!client.connected()) {
+    reconnect();
+  }
+  client.loop();
+
+  unsigned long currentMillis = millis();
+
+  if (currentMillis - lastTelemetryTime >= telemetryInterval) {
+    lastTelemetryTime = currentMillis;
+
+    float temperature = dht.readTemperature();
+    float humidity = dht.readHumidity();
+    float distance = readDistanceCM();
+    int ldrValue = analogRead(LDR_PIN);
+
+    if (isnan(temperature) || isnan(humidity)) {
+      Serial.println("Failed to read DHT11 sensor");
+      return;
+    }
+
+    bool ledState;
+    bool buzzerState;
+    int servoAngle;
+
+    // =====================
+    // Automation Logic
+    // =====================
+    if (!manualControlEnabled) {
+      // LED auto based on LDR
+      if (ldrValue < LDR_THRESHOLD) {
+        ledState = true;
+      } else {
+        ledState = false;
+      }
+
+      // Servo + buzzer auto based on distance
+      if (distance > 0 && distance < DISTANCE_THRESHOLD) {
+        buzzerState = true;
+        servoAngle = 90;
+      } else {
+        buzzerState = false;
+        servoAngle = 0;
+      }
+
+      digitalWrite(LED_PIN, ledState ? HIGH : LOW);
+      digitalWrite(BUZZER_PIN, buzzerState ? HIGH : LOW);
+      myServo.write(servoAngle);
+    } else {
+      ledState = ledManualState;
+      buzzerState = buzzerManualState;
+      servoAngle = servoManualAngle;
+
+      digitalWrite(LED_PIN, ledState ? HIGH : LOW);
+      digitalWrite(BUZZER_PIN, buzzerState ? HIGH : LOW);
+      myServo.write(servoAngle);
+    }
+
+    // =====================
+    // Serial Monitor Output
+    // =====================
+    Serial.println("========== SENSOR READING ==========");
+    Serial.print("Temperature: ");
+    Serial.print(temperature);
+    Serial.println(" C");
+
+    Serial.print("Humidity: ");
+    Serial.print(humidity);
+    Serial.println(" %");
+
+    Serial.print("Distance: ");
+    Serial.print(distance);
+    Serial.println(" cm");
+
+    Serial.print("LDR Value: ");
+    Serial.println(ldrValue);
+
+    Serial.print("LED State: ");
+    Serial.println(ledState ? "ON" : "OFF");
+
+    Serial.print("Buzzer State: ");
+    Serial.println(buzzerState ? "ON" : "OFF");
+
+    Serial.print("Servo Angle: ");
+    Serial.println(servoAngle);
+
+    Serial.print("Mode: ");
+    Serial.println(manualControlEnabled ? "MANUAL" : "AUTO");
+
+    // =====================
+    // Publish to ThingsBoard
+    // =====================
+    publishTelemetry(temperature, humidity, distance, ldrValue, ledState, buzzerState, servoAngle);
+  }
+}
